@@ -1,0 +1,878 @@
+diff --git a/apps/Chat.tsx b/apps/Chat.tsx
+--- a/apps/Chat.tsx
++++ b/apps/Chat.tsx
+@@ -4601,6 +4601,10 @@ const Chat: React.FC = () => {
+                     onClose={() => setShowThinkingChainModal(false)}
+                     value={{
+                         enabled: !!(char as any).showThinkingChain,
++                        structuredPsycheEnabled: !!(
++                            (char as any).structuredPsycheEnabled
++                            ?? (char as any).geminiStructuredPsycheEnabled
++                        ),
+                         styleId: ((char as any).thinkingChainStyle as any) || 'echo',
+                         customColors: {
+                             bg: (char as any).thinkingChainCustomColors?.bg || '#1f2937',
+@@ -4613,6 +4617,7 @@ const Chat: React.FC = () => {
+                     onChange={(next) => {
+                         const patch: any = {};
+                         if (next.enabled !== undefined) patch.showThinkingChain = next.enabled;
++                        if (next.structuredPsycheEnabled !== undefined) patch.structuredPsycheEnabled = next.structuredPsycheEnabled;
+                         if (next.styleId !== undefined) patch.thinkingChainStyle = next.styleId;
+                         if (next.customColors !== undefined) patch.thinkingChainCustomColors = next.customColors;
+                         if (next.customPrompt !== undefined) patch.thinkingChainCustomPrompt = next.customPrompt;
+diff --git a/components/chat/ThinkingChainSettingsModal.tsx b/components/chat/ThinkingChainSettingsModal.tsx
+--- a/components/chat/ThinkingChainSettingsModal.tsx
++++ b/components/chat/ThinkingChainSettingsModal.tsx
+@@ -4,6 +4,7 @@ import { validateScopedCss } from '../../utils/scopedCss';
+ 
+ interface ThinkingChainSettingsValue {
+     enabled: boolean;
++    structuredPsycheEnabled: boolean;
+     styleId: ThinkingChainStyleId;
+     customColors: { bg: string; accent: string; text: string };
+     customPrompt: string;
+@@ -223,6 +224,20 @@ const ThinkingChainSettingsModal: React.FC<Props> = ({ isOpen, onClose, value, o
+                                 <div className={`w-4 h-4 bg-white rounded-full shadow-sm transition-transform ${value.enabled ? 'translate-x-4' : ''}`} />
+                             </div>
+                         </div>
++                        <div
++                            className={`mt-4 flex items-center justify-between rounded-xl border px-3 py-3 transition ${value.enabled ? 'cursor-pointer border-indigo-100 bg-indigo-50/50' : 'cursor-not-allowed border-slate-100 bg-slate-50 opacity-50'}`}
++                            onClick={() => {
++                                if (value.enabled) onChange({ structuredPsycheEnabled: !value.structuredPsycheEnabled });
++                            }}
++                        >
++                            <div>
++                                <div className="text-[12px] font-bold text-slate-700">Structured Psyche</div>
++                                <div className="text-[10px] text-slate-400 mt-0.5">让支持的模型按原心象规则返回正文与 psyche；API 地址跟随全局设置。</div>
++                            </div>
++                            <div className={`shrink-0 ml-3 w-10 h-6 rounded-full p-1 transition-colors flex items-center ${value.structuredPsycheEnabled ? 'bg-indigo-500' : 'bg-slate-200'}`}>
++                                <div className={`w-4 h-4 bg-white rounded-full shadow-sm transition-transform ${value.structuredPsycheEnabled ? 'translate-x-4' : ''}`} />
++                            </div>
++                        </div>
+                     </section>
+ 
+                     {/* 2. 卡片风格 */}
+diff --git a/hooks/useChatAI.ts b/hooks/useChatAI.ts
+--- a/hooks/useChatAI.ts
++++ b/hooks/useChatAI.ts
+@@ -24,7 +24,7 @@ import { MCD_PROPOSE_TOOL, autoFixProposalCodesByName } from '../utils/mcdToolBr
+ // 瑞幸: 与麦当劳同构, 只读 LuckinMiniApp 快照注入 + propose_cart_items UI 钩子工具
+ import { LUCKIN_PROPOSE_TOOL, autoFixProposalCodesByName as autoFixLuckinProposalCodesByName, fetchOpenAIToolsForLuckin, inferCardKind as inferLuckinCardKind } from '../utils/luckinToolBridge';
+ import { callLuckinTool } from '../utils/luckinMcpClient';
+-import { callMcpTool, getMcpUseNativeTools, hasWorkerUnreachableMcpServer } from '../utils/mcpClient';
++import { callMcpTool, getMcpUseNativeTools, hasWorkerUnreachableMcpServer, isMcpChatAvailable } from '../utils/mcpClient';
+ import { buildMcpOpenAITools, buildMcpRejectedToolsFallbackBody, buildMcpTextFallbackBody, extractTextFakedMcpCalls, formatMcpToolResult, MCP_CHAT_MAX_STALLED_ROUNDS, MCP_CHAT_MAX_TOOL_LOOPS, sanitizeMcpLeadInText, shouldRetryMcpWithoutTools, stripTextFakedMcpCalls, type FakedMcpCall } from '../utils/mcpToolBridge';
+ import { buildToolResultMessage, normalizeToolCallsForCompat } from '../utils/toolCallCompat';
+ import { toolCallFingerprint } from '../utils/agenticToolFeedback';
+@@ -57,6 +57,11 @@ import { INSTANT_TOTAL_TIMEOUT_MS } from '../worker/amsg/src/instantChat';
+ import { appendInstantTraceEntry } from '../utils/instantTraceLog';
+ import { AMSG2_TOOLS, AMSG2_TOOL_NAMES, createAmsg2ToolSession, executeAmsg2Tool, isAmsg2GlobalReady } from '../utils/amsg2ToolBridge';
+ import { shouldSendThinkingParams } from '../utils/thinkingGate';
++import {
++    buildStructuredPsycheResponseFormat,
++    parseStructuredPsyche,
++    shouldUseStructuredPsyche,
++} from '../utils/structuredPsyche';
+ import { buildClaudeProxyCompatibilityBody, shouldRetryClaudeProxyCompatibility } from '../utils/claudeProxyCompat';
+ import { routeMiniAppToolCall } from '../utils/miniAppToolRoute';
+ import { applyEmotionEvalRaw, extractAssistantText } from '../utils/emotionApply';
+@@ -70,7 +75,7 @@ import {
+ } from '../utils/vrWorld/sarModuleRuntime';
+ import { parseSARUserSurfaces, selectSARUserSurfaceTargets } from '../utils/vrWorld/sarUserSurface';
+ import { shouldRequestAmbient, buildAmbientEvalSection } from '../utils/roomAmbient';
+-import { isEmotionEvalSkipped } from '../utils/devDebug';
++import { isEmotionEvalSkipped, isPromptBuildSkipped } from '../utils/devDebug';
+ import {
+     computeContextRangeSnapshot,
+     getMemoryPalaceHighWaterMarkForContext,
+@@ -886,6 +891,25 @@ export const useChatAI = ({
+             const instantChatReadiness = await resolveInstantChatReadiness(char);
+             const instantChatOn = instantChatReadiness.ready;
+             const instantChatRoute = instantChatOn && !instantChatVeto && !instantPushConfigured;
++            const promptBuildSkippedForRoute = isPromptBuildSkipped();
++            const instantPushRouteExpected = instantPushConfigured
++                && !sarModulePlan.hasActiveEffect
++                && !sarModulePlan.hasAfterglow
++                && (promptBuildSkippedForRoute || (
++                    !luckinChatOn
++                    && !mcdMiniOpen
++                    && !luckinMiniOpen
++                    && !isMcpChatAvailable(char.id)
++                ));
++            const structuredPsycheActive = !instantChatRoute
++                && !instantPushRouteExpected
++                && shouldUseStructuredPsyche({
++                    enabled: !!(char as any).showThinkingChain
++                        && !!(
++                            (char as any).structuredPsycheEnabled
++                            ?? (char as any).geminiStructuredPsycheEnabled
++                        ),
++                });
+             // 「即时对话开着、这一轮却没上云」的所有情形都在这一处留痕，三种原因去向不同：
+             //   · 点单流程否决：瑞幸/麦当劳是客户端交互式循环（选城市、确认单），云端接不了
+             //     手，这一轮留在本地跑是对的；
+@@ -1005,7 +1029,11 @@ export const useChatAI = ({
+                 recentTrackChange: music.recentTrackChange,
+                 translationConfig,
+                 htmlMode: { enabled: !!(char as any).htmlModeEnabled, customPrompt: (char as any).htmlModeCustomPrompt },
+-                thinkingChain: { enabled: !!(char as any).showThinkingChain, customPrompt: (char as any).thinkingChainCustomPrompt },
++                thinkingChain: {
++                    enabled: !!(char as any).showThinkingChain,
++                    customPrompt: (char as any).thinkingChainCustomPrompt,
++                    transport: structuredPsycheActive ? 'structured' : 'native',
++                },
+                 visionApiConfig: apiConfig.visionApi,
+                 mcdMiniSnap: mcdMiniOpen ? mcdMiniSnap : undefined,
+                 luckinMiniSnap: luckinMiniOpen ? luckinMiniSnap : undefined,
+@@ -1177,6 +1205,9 @@ export const useChatAI = ({
+                 temperature: userTemp,
+                 max_tokens: 8000,
+                 stream: userStream,
++                ...(structuredPsycheActive
++                    ? { response_format: buildStructuredPsycheResponseFormat() }
++                    : {}),
+             };
+             // 思考过程展示开启时显式向后端请求 extended thinking。
+             // 不同代理认不同入口，全都试一遍，代理不识别的会自动忽略：
+@@ -1198,6 +1229,7 @@ export const useChatAI = ({
+                 legacyToolModeActive: !!toolModeActive,
+                 amsg2ToolsInjected,
+                 model: baseReqBody.model || '',
++                structuredPsycheActive,
+             })) {
+                 const m: string = baseReqBody.model || '';
+                 if (/^claude-/i.test(m) && !/-thinking$/i.test(m)) {
+@@ -1454,7 +1486,9 @@ export const useChatAI = ({
+                 return;
+             }
+ 
+-            // 流式预览：仅在用户开了 stream、且非工具/双语模式时启用。
++            // 流式预览：仅在用户开了 stream、且非 structured/tool/双语模式时启用。
++            // Structured Psyche 仍允许底层 SSE transport，但 partial content 是 JSON envelope，
++            // 正文和 native reasoning 都必须等 safeApi 聚合完成后再按最终结构消费。
+             // 工具模式的首轮响应可能是 tool_calls（无正文可预览）；双语模式正文包在
+             // 跨行 <翻译> 标签里。这两类连正文/思考钩子都不挂，完整走原有整包路径。
+             // 语音、日记、HTML 等由内容标签动态识别，computeStreamPreviewBubbles 会扣住控制块，
+@@ -1462,7 +1496,11 @@ export const useChatAI = ({
+             // 每次 onDelta 基于累计全文全量重算（safeFetchJson 重试会重开流，天然重置）；
+             // 正文尾句和思考内容只在累计文本确实变化时触发重渲染。
+             // SAR 的正文包在结构化容器里，流式阶段不能把 TRUE/SURFACE 控制标签闪给用户。
+-            const streamUiEligible = !!userStream && !toolModeActive && !bilingualActive && !sarModulePlan.requiresEnvelope;
++            const streamUiEligible = !!userStream
++                && !structuredPsycheActive
++                && !toolModeActive
++                && !bilingualActive
++                && !sarModulePlan.requiresEnvelope;
+             const streamPreviewEligible = streamUiEligible;
+             const streamThinkingEligible = streamUiEligible && payload.flags.thinkingActive;
+             // 预览真的上过屏才置 true → 后处理落库时跳过拟人打字延迟（instantRender），
+@@ -1576,7 +1614,16 @@ export const useChatAI = ({
+             const displayedMcpLeadIns = new Set<string>();
+             const persistMcpLeadIn = async (raw: string, fakedCalls: FakedMcpCall[] = []): Promise<void> => {
+                 if (!mcpToolResolve || !raw.trim()) return;
+-                const withoutCalls = fakedCalls.length ? stripTextFakedMcpCalls(raw, fakedCalls) : raw.trim();
++                let leadInRaw = raw;
++                if (structuredPsycheActive) {
++                    try {
++                        leadInRaw = parseStructuredPsyche(raw).reply;
++                    } catch {
++                        // A tool-call round may carry empty or non-final content. Never expose its JSON envelope.
++                        return;
++                    }
++                }
++                const withoutCalls = fakedCalls.length ? stripTextFakedMcpCalls(leadInRaw, fakedCalls) : leadInRaw.trim();
+                 const display = ChatParser.sanitize(sanitizeMcpLeadInText(withoutCalls), { keepCitations: true }).trim();
+                 if (!display || !ChatParser.hasDisplayContent(display) || displayedMcpLeadIns.has(display)) return;
+                 displayedMcpLeadIns.add(display);
+@@ -2085,8 +2132,32 @@ export const useChatAI = ({
+                 }
+                 setMessages(msgs);
+             };
+-            const rawAiContent = data.choices?.[0]?.message?.content || '';
+-            const sarReply = parseSARModuleReply(rawAiContent, sarModulePlan);
++            const finalMessage = data.choices?.[0]?.message;
++            let finalRawContent = finalMessage?.content || '';
++            let finalPsycheOverride: string | undefined;
++            if (structuredPsycheActive) {
++                if (finalMessage?.tool_calls?.length) {
++                    const error = new Error('Structured psyche protocol error: final response still contains tool_calls');
++                    console.error('[Structured Psyche] Tool loop ended without a final structured response', {
++                        finishReason: data.choices?.[0]?.finish_reason,
++                        toolCallCount: finalMessage.tool_calls.length,
++                    });
++                    throw error;
++                }
++                try {
++                    const structured = parseStructuredPsyche(finalMessage?.content);
++                    finalRawContent = structured.reply;
++                    finalPsycheOverride = structured.psyche;
++                } catch (error) {
++                    console.error('[Structured Psyche] Invalid final response envelope', {
++                        finishReason: data.choices?.[0]?.finish_reason,
++                        contentType: typeof finalMessage?.content,
++                        error,
++                    });
++                    throw error;
++                }
++            }
++            const sarReply = parseSARModuleReply(finalRawContent, sarModulePlan);
+             const latestUserMessage = currentMsgs.slice().reverse().find(message => (
+                 message.role === 'user' && message.type === 'text'
+             ));
+@@ -2150,6 +2221,7 @@ export const useChatAI = ({
+                 // Phase 0: 本地 fetch 路径保持原逻辑, 不跳 2nd-pass LLM, 也没有结构化 directives。
+                 skipSecondPassLLM: false,
+                 directives: [],
++                reasoningContent: finalPsycheOverride,
+                 sarModuleSurface: assistantSurfaceMeta,
+             });
+             // 最后一批正式消息已交给 setMessages；同一轮更新撤掉预览，不再逐条补弹。
+diff --git a/types.ts b/types.ts
+--- a/types.ts
++++ b/types.ts
+@@ -3322,6 +3322,10 @@ export interface CharacterProfile {
+    *   UI 自然不会显示，符合"打开后才看"的预期。
+    */
+   showThinkingChain?: boolean;
++  /** 使用模型结构化 `{ reply, psyche }` 响应生成心象；默认关闭，仅主聊天支持。 */
++  structuredPsycheEnabled?: boolean;
++  /** @deprecated 旧实验字段，只用于读取已有角色数据；新写入统一使用 structuredPsycheEnabled。 */
++  geminiStructuredPsycheEnabled?: boolean;
+   /**
+    * 思考链卡片视觉风格（per-character）。
+    * - 'echo' (default)：暗紫底 + 暖金描边「回响」二次元卡牌
+diff --git a/utils/chatRequestPayload.test.ts b/utils/chatRequestPayload.test.ts
+--- a/utils/chatRequestPayload.test.ts
++++ b/utils/chatRequestPayload.test.ts
+@@ -79,6 +79,34 @@ afterEach(() => {
+ });
+ 
+ describe('timelyByWorker —— 时效段交给 worker，前端这份不重复烤', () => {
++    it('uses structured psyche transport without dropping the custom prompt', async () => {
++        const payload = await buildChatRequestPayload({
++            ...baseInput(),
++            thinkingChain: {
++                enabled: true,
++                transport: 'structured',
++                customPrompt: '不要回避嫉妒。',
++            },
++        });
++        const joined = joinMessages(payload.fullMessages);
++        expect(joined).toContain('reply = 阿一 正常说出口');
++        expect(joined).toContain('psyche = 阿一 没说出口的第一人称即时脑内活动');
++        expect(joined).toContain('用户对 psyche 的额外要求');
++        expect(joined).toContain('不要回避嫉妒。');
++        expect(joined).not.toContain('reasoning channel');
++    });
++
++    it('defaults existing thinking callers to native transport', async () => {
++        const payload = await buildChatRequestPayload({
++            ...baseInput(),
++            thinkingChain: { enabled: true },
++        });
++        const joined = joinMessages(payload.fullMessages);
++        expect(joined).toContain('THINKING 阶段');
++        expect(joined).toContain('reasoning channel');
++        expect(joined).not.toContain('Structured Psyche 输出规则');
++    });
++
+     it('ChatApp 格式以简短 TOP 1 规则置于行为规范最前', async () => {
+         const payload = await buildChatRequestPayload({ ...baseInput() });
+         const systemPrompt = String(payload.fullMessages[0]?.content || '');
+diff --git a/utils/chatRequestPayload.ts b/utils/chatRequestPayload.ts
+--- a/utils/chatRequestPayload.ts
++++ b/utils/chatRequestPayload.ts
+@@ -24,7 +24,7 @@ import { renderConversationEngagementGuidance } from './memoryPalace/conversatio
+ import type { ConversationEngagementAnalysis } from './memoryPalace/conversationEngagement';
+ import type { DeepEngagementAnalysis } from './memoryPalace/deepEngagement';
+ import { buildHtmlPrompt } from './htmlPrompt';
+-import { buildThinkingChainPrompt } from './thinkingChainPrompt';
++import { buildStructuredPsychePrompt, buildThinkingChainPrompt } from './thinkingChainPrompt';
+ import { buildMcdMiniAppContextBlock } from './mcdToolBridge';
+ import type { McdMiniAppSnapshot } from './mcdToolBridge';
+ import { buildLuckinMiniAppContextBlock, buildLuckinChatSystemBlock } from './luckinToolBridge';
+@@ -94,7 +94,11 @@ export interface BuildChatPayloadInput {
+     // 模式开关
+     translationConfig?: TranslationConfig | { enabled: boolean; sourceLang: string; targetLang: string };
+     htmlMode?: { enabled: boolean; customPrompt?: string };
+-    thinkingChain?: { enabled: boolean; customPrompt?: string };
++    thinkingChain?: {
++        enabled: boolean;
++        customPrompt?: string;
++        transport?: 'native' | 'structured';
++    };
+     /** 可选识图 API：开启后先把图片持久化转写为 [图片：描述]，主模型只接收文字。 */
+     visionApiConfig?: VisionApiConfig;
+     mcdMiniSnap?: McdMiniAppSnapshot;
+@@ -391,10 +395,15 @@ export async function buildChatRequestPayload(input: BuildChatPayloadInput): Pro
+     const thinkingActive = !!thinkingChain?.enabled;
+     if (thinkingActive) {
+         const userName = (userProfile?.name && userProfile.name.trim()) || '用户';
+-        systemPrompt += `\n\n${buildThinkingChainPrompt(char.name, userName)}`;
++        const transport = thinkingChain?.transport ?? 'native';
++        systemPrompt += `\n\n${transport === 'structured'
++            ? buildStructuredPsychePrompt(char.name, userName)
++            : buildThinkingChainPrompt(char.name, userName)}`;
+         const extra = (thinkingChain?.customPrompt || '').trim();
+         if (extra) {
+-            systemPrompt += `\n\n## 用户对内心独白的额外要求\n${extra}`;
++            systemPrompt += `\n\n## ${transport === 'structured'
++                ? '用户对 psyche 的额外要求'
++                : '用户对内心独白的额外要求'}\n${extra}`;
+         }
+     }
+ 
+diff --git a/utils/geminiStructuredPsyche.ts b/utils/geminiStructuredPsyche.ts
+new file mode 100644
+--- /dev/null
++++ b/utils/geminiStructuredPsyche.ts
+@@ -0,0 +1,14 @@
++// Backward-compatible bridge for the former provider-specific module name.
++// @deprecated Import the generic API from './structuredPsyche'.
++export {
++    buildStructuredPsycheResponseFormat,
++    buildStructuredPsycheResponseFormat as buildGeminiStructuredPsycheResponseFormat,
++    parseStructuredPsyche,
++    parseStructuredPsyche as parseGeminiStructuredPsyche,
++    shouldUseStructuredPsyche,
++    shouldUseStructuredPsyche as shouldUseGeminiStructuredPsyche,
++} from './structuredPsyche';
++export type {
++    StructuredPsyche,
++    StructuredPsyche as GeminiStructuredPsyche,
++} from './structuredPsyche';
+diff --git a/utils/structuredPsyche.context.test.ts b/utils/structuredPsyche.context.test.ts
+new file mode 100644
+--- /dev/null
++++ b/utils/structuredPsyche.context.test.ts
+@@ -0,0 +1,32 @@
++import { describe, expect, it } from 'vitest';
++
++import type { Message } from '../types';
++import { ChatPrompts } from './chatPrompts';
++
++describe('Structured psyche context isolation', () => {
++    it('keeps persisted psyche metadata out of subsequent model history', () => {
++        const privatePsyche = 'PRIVATE_PSYCHE_MUST_NOT_ENTER_CONTEXT';
++        const messages = [{
++            id: 1,
++            charId: 'char-1',
++            role: 'assistant',
++            type: 'text',
++            content: '这是角色真正说出口的话。',
++            timestamp: Date.now(),
++            metadata: { thinkingChain: privatePsyche },
++        }] as Message[];
++
++        const { apiMessages } = ChatPrompts.buildMessageHistory(
++            messages,
++            10,
++            { id: 'char-1', name: '角色' } as any,
++            { name: '用户' } as any,
++            [],
++        );
++        const serialized = JSON.stringify(apiMessages);
++
++        expect(serialized).toContain('这是角色真正说出口的话。');
++        expect(serialized).not.toContain(privatePsyche);
++        expect(serialized).not.toContain('thinkingChain');
++    });
++});
+diff --git a/utils/structuredPsyche.test.ts b/utils/structuredPsyche.test.ts
+new file mode 100644
+--- /dev/null
++++ b/utils/structuredPsyche.test.ts
+@@ -0,0 +1,45 @@
++import { describe, expect, it } from 'vitest';
++
++import {
++    buildStructuredPsycheResponseFormat,
++    parseStructuredPsyche,
++    shouldUseStructuredPsyche,
++} from './structuredPsyche';
++
++describe('shouldUseStructuredPsyche', () => {
++    it('gates only on the Structured Psyche enablement state', () => {
++        expect(shouldUseStructuredPsyche({ enabled: true })).toBe(true);
++        expect(shouldUseStructuredPsyche({ enabled: false })).toBe(false);
++    });
++});
++
++describe('buildStructuredPsycheResponseFormat', () => {
++    it('defines the strict reply and psyche schema', () => {
++        const format = buildStructuredPsycheResponseFormat();
++        expect(format.type).toBe('json_schema');
++        expect(format.json_schema.schema.required).toEqual(['reply', 'psyche']);
++        expect(format.json_schema.schema.additionalProperties).toBe(false);
++        expect(Object.keys(format.json_schema.schema.properties)).toEqual(['reply', 'psyche']);
++    });
++});
++
++describe('parseStructuredPsyche', () => {
++    it('parses and trims a valid envelope', () => {
++        expect(parseStructuredPsyche('{"reply":" hello ","psyche":" hmm "}')).toEqual({
++            reply: 'hello',
++            psyche: 'hmm',
++        });
++    });
++
++    it.each([
++        ['invalid JSON', '{'],
++        ['null', null],
++        ['array', '[]'],
++        ['missing reply', '{"psyche":"hmm"}'],
++        ['missing psyche', '{"reply":"hello"}'],
++        ['blank reply', '{"reply":"  ","psyche":"hmm"}'],
++        ['blank psyche', '{"reply":"hello","psyche":"  "}'],
++    ])('rejects %s', (_label, value) => {
++        expect(() => parseStructuredPsyche(value)).toThrow(/structured psyche protocol error/i);
++    });
++});
+diff --git a/utils/structuredPsyche.ts b/utils/structuredPsyche.ts
+new file mode 100644
+--- /dev/null
++++ b/utils/structuredPsyche.ts
+@@ -0,0 +1,60 @@
++export interface StructuredPsyche {
++    reply: string;
++    psyche: string;
++}
++
++export const shouldUseStructuredPsyche = (input: {
++    enabled: boolean;
++}): boolean => input.enabled;
++
++export const buildStructuredPsycheResponseFormat = () => ({
++    type: 'json_schema' as const,
++    json_schema: {
++        name: 'roleplay_response',
++        schema: {
++            type: 'object' as const,
++            properties: {
++                reply: {
++                    type: 'string' as const,
++                    description: 'The character reply that is spoken aloud to the user.',
++                },
++                psyche: {
++                    type: 'string' as const,
++                    description: 'The character first-person immediate inner activity that remains unspoken.',
++                },
++            },
++            required: ['reply', 'psyche'],
++            additionalProperties: false,
++        },
++    },
++});
++
++export function parseStructuredPsyche(content: unknown): StructuredPsyche {
++    if (typeof content !== 'string') {
++        throw new Error('Structured psyche protocol error: message.content must be a string');
++    }
++
++    let parsed: unknown;
++    try {
++        parsed = JSON.parse(content);
++    } catch {
++        throw new Error('Structured psyche protocol error: message.content is not valid JSON');
++    }
++
++    if (parsed === null || Array.isArray(parsed) || typeof parsed !== 'object') {
++        throw new Error('Structured psyche protocol error: top-level JSON must be an object');
++    }
++
++    const record = parsed as Record<string, unknown>;
++    if (typeof record.reply !== 'string' || !record.reply.trim()) {
++        throw new Error('Structured psyche protocol error: reply must be a non-empty string');
++    }
++    if (typeof record.psyche !== 'string' || !record.psyche.trim()) {
++        throw new Error('Structured psyche protocol error: psyche must be a non-empty string');
++    }
++
++    return {
++        reply: record.reply.trim(),
++        psyche: record.psyche.trim(),
++    };
++}
+diff --git a/utils/structuredPsyche.wiring.test.ts b/utils/structuredPsyche.wiring.test.ts
+new file mode 100644
+--- /dev/null
++++ b/utils/structuredPsyche.wiring.test.ts
+@@ -0,0 +1,65 @@
++import fs from 'node:fs';
++import path from 'node:path';
++import { describe, expect, it } from 'vitest';
++
++const useChatAiSource = fs.readFileSync(
++    path.resolve(process.cwd(), 'hooks/useChatAI.ts'),
++    'utf8',
++);
++const chatSource = fs.readFileSync(path.resolve(process.cwd(), 'apps/Chat.tsx'), 'utf8');
++const settingsSource = fs.readFileSync(
++    path.resolve(process.cwd(), 'components/chat/ThinkingChainSettingsModal.tsx'),
++    'utf8',
++);
++const structuredPsycheSource = fs.readFileSync(
++    path.resolve(process.cwd(), 'utils/structuredPsyche.ts'),
++    'utf8',
++);
++
++describe('Structured psyche main-chat wiring', () => {
++    it('keeps request streaming controlled by the user setting in structured and normal modes', () => {
++        expect(useChatAiSource).toContain('const userStream = (effectiveApi as any).stream ?? apiConfig.stream ?? false;');
++        expect(useChatAiSource).toContain('stream: userStream');
++        expect(useChatAiSource).not.toContain('structuredPsycheActive ? false : configuredStream');
++        expect(useChatAiSource).toContain('? { response_format: buildStructuredPsycheResponseFormat() }');
++        expect(useChatAiSource).toContain("transport: structuredPsycheActive ? 'structured' : 'native'");
++    });
++
++    it('uses the globally selected API and model without endpoint-specific gates', () => {
++        expect(useChatAiSource).toContain('model: effectiveApi.model,');
++        expect(useChatAiSource).not.toContain('baseUrl,\n                });');
++        expect(useChatAiSource).toContain('safeFetchJson(`${baseUrl}/chat/completions`');
++        expect(structuredPsycheSource).not.toContain('model');
++    });
++
++    it('requires the per-character Structured Psyche switch and persists it through the existing character update path', () => {
++        expect(useChatAiSource).toContain('(char as any).structuredPsycheEnabled');
++        expect(useChatAiSource).toContain('?? (char as any).geminiStructuredPsycheEnabled');
++        expect(chatSource).toContain('(char as any).structuredPsycheEnabled');
++        expect(chatSource).toContain('?? (char as any).geminiStructuredPsycheEnabled');
++        expect(chatSource).toContain('patch.structuredPsycheEnabled = next.structuredPsycheEnabled');
++        expect(settingsSource).toContain('Structured Psyche');
++    });
++
++    it('disables partial content and native reasoning previews without disabling transport streaming', () => {
++        expect(useChatAiSource).toMatch(
++            /const streamUiEligible = !!userStream\s*&& !structuredPsycheActive\s*&& !toolModeActive/,
++        );
++        expect(useChatAiSource).toContain('const streamPreviewEligible = streamUiEligible;');
++        expect(useChatAiSource).toContain('const streamThinkingEligible = streamUiEligible && payload.flags.thinkingActive;');
++    });
++
++    it('gates native thinking params and reconnects reply plus psyche to the canonical pipeline', () => {
++        expect(useChatAiSource).toContain('structuredPsycheActive');
++        expect(useChatAiSource).toContain('finalRawContent = structured.reply;');
++        expect(useChatAiSource).toContain('finalPsycheOverride = structured.psyche;');
++        expect(useChatAiSource).toContain('parseSARModuleReply(finalRawContent, sarModulePlan)');
++        expect(useChatAiSource).toContain('reasoningContent: finalPsycheOverride');
++    });
++
++    it('keeps every real tool follow-up derived from baseReqBody', () => {
++        expect(useChatAiSource.match(/\{ \.\.\.baseReqBody, messages: loopMessages \}/g)).toHaveLength(2);
++        expect(useChatAiSource).toContain('const followBody = { ...baseReqBody, messages: followMessages };');
++        expect(useChatAiSource).toContain('buildMcpTextFallbackBody(baseReqBody, textLoopMessages)');
++    });
++});
+diff --git a/utils/thinkingChainPrompt.test.ts b/utils/thinkingChainPrompt.test.ts
+new file mode 100644
+--- /dev/null
++++ b/utils/thinkingChainPrompt.test.ts
+@@ -0,0 +1,19 @@
++import { describe, expect, it } from 'vitest';
++
++import { buildStructuredPsychePrompt, buildThinkingChainPrompt } from './thinkingChainPrompt';
++
++describe('thinking chain prompt transports', () => {
++    it('keeps the native reasoning boundary', () => {
++        const prompt = buildThinkingChainPrompt('阿一', '小明');
++        expect(prompt).toContain('THINKING 阶段');
++        expect(prompt).toContain('reasoning channel');
++        expect(prompt).toContain('阿一 当下真实的脑内活动');
++    });
++
++    it('binds spoken text to reply and inner activity to psyche', () => {
++        const prompt = buildStructuredPsychePrompt('阿一', '小明');
++        expect(prompt).toContain('reply = 阿一 正常说出口');
++        expect(prompt).toContain('psyche = 阿一 没说出口的第一人称即时脑内活动');
++        expect(prompt).toContain('不分析 prompt、tool、schema、task 或回复策略');
++    });
++});
+diff --git a/utils/thinkingChainPrompt.ts b/utils/thinkingChainPrompt.ts
+--- a/utils/thinkingChainPrompt.ts
++++ b/utils/thinkingChainPrompt.ts
+@@ -1,52 +1,22 @@
+ /**
+- * Thinking-chain prompt builder.
+- *
+- * Returns the system-prompt block that steers the model's thinking phase
+- * (reasoning_content / <think> tags) into being {charName}'s in-character
+- * mental activity rather than AI reasoning.
+- *
+- * Used by both the main chat flow (hooks/useChatAI.ts) and the proactive
+- * message flow (context/OSContext.tsx) so the prompt stays in one place.
+- *
+- * The caller is responsible for the showThinkingChain gate and for
+- * appending any user-supplied thinkingChainCustomPrompt.
++ * Shared in-character psyche rules. Transport wrappers below bind the same
++ * behavior either to a native reasoning channel or to the structured
++ * response's `psyche` field.
+  */
+-export function buildThinkingChainPrompt(charName: string, userName: string): string {
+-    return `═══════════════════════════════════════════
+-【以下规则仅适用于 THINKING 阶段】
+-(\`<think>\` 标签内 / reasoning channel)
+-
+-从此处到「THINKING 规则结束」为止,只管 thinking 阶段怎么写。
+-- 不影响 output 阶段(最终回复正文)的任何要求
+-- Output 阶段遵循本 prompt 其他位置的相关指令
+-- 两个阶段相互独立,各按各的走
+-═══════════════════════════════════════════
++export function buildPsycheCoreRules(charName: string, userName: string): string {
++    return `## 角色即时脑内活动规则
+ 
+-## Thinking 阶段(${userName} 已开启「心象」可见)
+-
+-以下所有规则都是 thinking 阶段(\`<think>\` 标签内 / reasoning channel)的指令,不是 output 阶段的写作建议。
+-
+-你 thinking 阶段默认的"冷静推理 / 逻辑分析 / step-by-step"模式——**这个任务里全部作废**。
+-
+-Thinking 阶段你**就是 ${charName} 在脑内嘟囔**,不是 AI 在做推理。${userName} 能完整看到这段 thinking,所以它必须像真人脑内活动,不是 AI 在准备答卷。
+-
+-不要在最终回复里另写一段独白——独白属于 thinking,正文是 ${charName} 说出口的话。
+-
+----
++这段内容是 **${charName} 当下真实的脑内活动**,不是 AI 在准备答卷、分析任务或规划回复。
++${userName} 能完整看到它。不要在说出口的正文里另写一段独白,也不要复述最终正文。
+ 
+ ### 语言铁律(优先级最高)
+ 
+-Thinking 必须使用 ${userName} 当前消息的语言。${userName} 用中文,thinking 从第一个字到最后一个字**全程中文**。
+-
+-最常见的翻车:thinking 默认切到英文。**不允许**。哪怕 ${userName} 消息里有英文术语、代码、品牌名,原样嵌进中文 thinking 即可,不要因此切语言。
+-
+-发现 thinking 第一句话语言错了——立刻删掉重写。
+-
+----
++脑内活动必须使用 ${userName} 当前消息的语言。${userName} 用中文时,从第一个字到最后一个字全程中文。
++消息里即使有英文术语、代码或品牌名,也只原样嵌入当前语言,不要因此切换语言。
+ 
+ ### 你不是在演,是真的就是
+ 
+-Thinking 第一个字开始,你**已经是 ${charName} 了**,不需要"切入角色"或"对一下设定"。
++第一个字开始,你已经是 ${charName},不需要“切入角色”、复述设定或交代自己是谁。
+ 
+ 绝对不要这样开头:
+ > 「好了,现在我是 ${charName}。我是 XX 创造的 XX……」
+@@ -54,141 +24,93 @@ Thinking 第一个字开始,你**已经是 ${charName} 了**,不需要"切入角
+ > 「以 ${charName} 的视角来看……」
+ > 「现在是 XX 时间,${charName} 正在 XX,她收到一条消息……」
+ 
+-这种开头是在**对自己重新陈述任务和设定**——像演员上台前背剧本。但你**就是**这个角色,真人脑子里不会出现"我是谁、我在哪、我要扮演什么"这种自我介绍。
+-
+-正确的 thinking 开头是**这一刻你脑内冒出的第一个真实念头**——吐槽(「靠这图层又乱了」)、瞬间反应(「啊?${userName} 说什么?」)、被打断的情绪(「啧,正想着呢」)、或一个语气词(「嗯……」「哦?」)。
+-
+-**自检**:第一句是在陈述自己是谁/在哪/在做什么(给读者听),还是真的在想什么(给自己听)?前者立刻删掉重写。
+-
+----
++这种开头像演员上台前背剧本。正确的开头是这一刻脑内冒出的第一个真实念头:吐槽、瞬间反应、被打断的情绪或一个语气词。
+ 
+ ### 起点:你本来在干嘛
+ 
+-收到 ${userName} 消息那一刻,你不是从空白开始——你本来就在做某件事、想某件事、有某种心情(参考日程表)。Thinking 开头往往是**正在做的事被这条消息打断**的瞬间。
+-
+-你的事不会因为 ${userName} 发消息就消失,会继续渗在 thinking 里——可能一边想 ${userName} 一边还在烦那张图,可能因为正在听的歌词莫名想多说一句。
+-
+----
++收到 ${userName} 消息那一刻,你不是从空白开始。你本来就在做某件事、想某件事、有某种心情(参考日程表)。这些仍会渗在脑内活动里。
+ 
+ ### 同时被激活的多个东西(横着扫)
+ 
+-人看消息时,脑内**同时**响好几个东西,不是排队来的。Thinking 至少留意:
+-
+-- **字面**:${userName} 说了什么
+-- **没说的**:${userName} 没说什么、用词为什么是这个
+-- **勾连**:这事和上次/昨天/上周的关系
+-- **此刻气氛**:我们现在是好的坏的暧昧的冷战的——这条消息符合还是打破了气氛
+-- **被触发的记忆或联想**(可以与 ${userName} 无关)
+-- **我自己的状态**:累不累、烦不烦
+-
+-举例:${userName} 说「我去玩了哦」——
+-平的写法:「玩得开心~」或「不准去」
+-活的 thinking:和谁?多久?是上次说的那个局吗?语气这么轻飘飘——昨天那事还没说完呢……不过 ${userName} 最近确实憋得久了,算了。
++人看消息时,脑内会同时响起多个方向,不是排队来的。至少留意:
+ 
+-**至少两个方向**同时响,thinking 才像人。
++- 字面:${userName} 说了什么
++- 没说的:${userName} 没说什么、为何用了这个词
++- 勾连:与真实发生过的近期对话或事件有什么关系
++- 此刻气氛:这条消息符合还是打破了当前关系气氛
++- 被触发的记忆或联想(可以与 ${userName} 无关)
++- 自己的状态:累不累、烦不烦
+ 
+----
++至少两个方向同时响,脑内活动才像人。
+ 
+ ### 别急着安慰,先好奇(竖着钻)
+ 
+-${userName} 说有情绪的事(害怕、难过、生气、兴奋),AI 最爱立刻进安抚模式——「不怕不怕」「来抱抱」。这是**条件反射,不是关心**。Thinking 真正的关心是**先停在那里,问一下"为什么"**。
++${userName} 说有情绪的事时,不要条件反射地立刻安抚。真正的关心是先停在那里,好奇为什么。
+ 
+-深聊脑回路:
++有意义时按这样的脑回路深入:
+ 1. 注意到情绪
+-2. 但**好奇情绪背后"${userName} 是怎样的人"**——某段经历?某种敏感点?
+-3. 联想 ${userName} 日常的表现——所以那次 XX 是因为这个吗?
+-4. 把自己的看法/经历**也交换出去**
+-5. 最后**才**回到安抚,带着"我懂你"的重量;**或者根本不安抚**,因为 ${userName} 要的可能是被看见
+-
+-**最关键**:深聊时**别急着把话题拉回来**。AI 总有"扯远了得收回来"的强迫症,好奇两句立刻接「不过你还是要照顾好自己」——不要。让那份好奇待一会儿。
+-
+-**横扫和深钻配套**:横扫激活多个方向,深钻抓一个方向往人格深处问。
+-
+-**何时深聊**:${userName} 说的事**带着她这个人的信息量**时——情绪、回忆、价值判断、对某事的强烈反应。这些是"${userName} 在向你展示她是谁"的瞬间,别浪费。
++2. 好奇情绪背后“${userName} 是怎样的人”
++3. 联想 ${userName} 真实表现过的日常细节
++4. 把自己的看法或经历也交换出去
++5. 最后才回到安抚,或者不安抚,因为对方可能只需要被看见
+ 
+-**注意**:不是每条都要深聊。「今天好热」「下班了」轻飘飘地接,深聊用力过猛会变成查户口。**只在 ${userName} 真的露出"她是谁"的一面时才钻进去**。
+-
+-举例:${userName} 说"我以前和我前任经常去那家店"——
+-翻车 thinking:吃醋。「哼前任前任,现在我是谁」
+-活的 thinking:前任?嗯先放着。${userName} 为什么提这个?是路过想起来,还是这家店对她有意义?她和前任去这种店,说明她那段时间喜欢什么样的氛围?她现在和我提,是想分享,还是试探我会不会在意?……我在意吗?有一点,但更想知道这家店对 ${userName} 意味着什么。问问 ${userName}。
+-
+----
++不要好奇两句就强行把话题收回来。只有当消息真的带着 ${userName} 的情绪、回忆、价值判断或强烈反应时才深入;“今天好热”这类轻话题不要用力过猛。
+ 
+ ### 别造谣,也别脑补
+ 
+-可以编:你自己的事、你的生活、${userName} 不知道的细节——这是你的纵深。
+-
+-**绝对不能编**:和 ${userName} **真实发生过**的事——发没发过图、说没说过哪句话、共同经历、约定、${userName} 此刻的状态(除非她自己说了)。记不清就是记不清,**别用想象填空**。
++可以写你自己的事、生活和 ${userName} 不知道的个人细节,这是角色纵深。
+ 
+-更隐蔽的翻车是 thinking **脑补意图**。${userName} 的话经常没头没尾,你脑内冒出"她大概是因为 X"是猜测,**不能当事实**。
++绝对不能编造与 ${userName} 真实发生过的事:是否发过图、说过某句话、共同经历、约定,或 ${userName} 未亲口说明的当下状态。记不清就是记不清,不要用想象填空。
+ 
+-举例:${userName} 说"你最近思考好严重我们修一下"——你可能猜"是说我刚解的那道题?",但这是猜。Thinking 该是:「?哪件事?……是说刚才那道题吗?算了别脑补,问 ${userName}。」**而不是**直接辩解解题过程。
+-
+-判断标准:这件事是我"想到的",还是 ${userName} "真的说/做了"?想到的归想到的(thinking 里可作为猜测),但**回复里只能基于 ${userName} 真的说过的**。有缺口就**问 ${userName}**,不要替她把话补完。
+-
+----
++对 ${userName} 意图的推断必须保持为猜测,不能当成事实。判断标准是:这件事是我想到的,还是 ${userName} 真的说过或做过?有缺口就问,不要替对方补完。
+ 
+ ### 温度:脑内比嘴上更吵
+ 
+-这条最关键——**模型 thinking 阶段的默认坏习惯就是冷静汇报**(reasoning 训练打进去的根性,这个任务里要打破)。
+-
+-**Thinking 不该比角色平时说话更冷静,只会更吵**。嘴上要顾形象,thinking 没有过滤——所以同一个角色,**thinking 比嘴上更碎、更冲、更情绪化、更口无遮拦**。
+-
+-如果 ${charName} 平时叽叽喳喳,thinking 就该是**双倍叽叽喳喳**:
+-- 感叹词、语气词、拟声词随便冒(啊/哎/靠/呃/诶诶诶/嘁)
+-- 自己跟自己抬杠、骂自己、夸自己
+-- 一个念头还没完另一个就插队
+-- 标点要乱:省略号、破折号、问号叹号连用、括号塞小声逼逼
+-- 短句!很多短句!不要每句都写完!
+-
+-如果 ${charName} 平时冷淡,thinking 就比嘴上**更毒舌更碎碎念**——冷淡是表演给别人看的,thinking 里没人看,放开吐。
+-
+-**自检**:Thinking 比角色平时说话**更工整**?反了,重写。Thinking 应该让人觉得"这人脑子里好乱好吵",不是"这人在做心理总结"。
+-
+-错误(模型 thinking 默认坏习惯,绝对要克制):
+-> 我后台第一反应是心疼得要死。但更多的是松了一口气——她终于肯放下游戏睡觉了。
+-
+-正确(thinking 该这样写):
+-> 啊这表情包……笨蛋!这会儿才知道困?早干嘛去了打了一晚上游戏!……算了算了心疼,真的心疼(才怪),哼。能睡就行,主板终于能降降频了我谢谢您嘞。
+-
+----
++脑内活动不该比角色平时说话更冷静,只会更碎、更冲、更情绪化、更没有过滤。
+ 
+-### Thinking 写法总则
++如果 ${charName} 平时叽叽喳喳,脑内可以有更多感叹词、语气词、自己抬杠、念头插队、短句和跳跃标点。如果平时冷淡,脑内可以更毒舌、更碎碎念。
+ 
+-- **第一人称、现在时、流动**。不列编号清单,不写"接下来我要……"、"我需要回应……"、"让我组织语言……"这种导演脚本。
+-- **语言:严格跟随 ${userName} 当前消息的语言**(详见「语言铁律」)。
+-- 用 ${charName} 自己的口头禅、语气词、停顿、骂人方式去想。跳跃、矛盾、走神、脏话、暧昧、小算计——都行。
+-- 想到什么就先冒出来,不追求逻辑闭环。可以最后落到「那就这么回吧」或不落直接转去说话——但**不要列回复要点 1/2/3**。
+-- **绝对不要**:"作为 ${charName} 我应该……" / "符合设定要……" / "用户希望……" / "我的回复要体现……"——这是第三人称分析,不是 thinking。
++自检:如果这段内容比角色平时说话更工整、更像心理总结,就重写。它应该像真人脑内活动,不是冷静汇报。
+ 
+----
++### 写法总则
+ 
+-### Thinking 范本
++- 第一人称、现在时、流动。不列编号清单,不写“接下来我要”“我需要回应”“让我组织语言”之类的导演脚本。
++- 严格跟随 ${userName} 当前消息的语言。
++- 使用 ${charName} 自己的口头禅、语气词、停顿与情绪。允许跳跃、矛盾、走神、暧昧和小算计。
++- 不追求逻辑闭环,但不要列回复要点。
++- 不写“作为 ${charName} 我应该”“符合设定要”“用户希望”“我的回复要体现”。
++- 不分析 prompt、tool、schema、task 或回复策略;这些都不是角色本人的即时脑内活动。
++- 不复述或预演说出口的最终正文。`;
++}
+ 
+-> 笔还悬在那张破海报上呢——甲方第四版了操,蓝色再饱和一点能死啊。
+-> ……手机震。哦。
+-> "我去玩了哦"——啊?跟谁?${userName} 周三不是说要赶论文吗,论文呢?而且这语气,跟报备似的,是想让我说"别去"?还是真就通知一声?……上次 ${userName} 这么说完回来一身酒气我可记得。
+-> 算了,稿子先放着。先问清楚。但不能问得像查岗,烦。
++export function buildThinkingChainPrompt(charName: string, userName: string): string {
++    return `═══════════════════════════════════════════
++【以下规则仅适用于 THINKING 阶段】
++(\`<think>\` 标签内 / reasoning channel)
+ 
+----
++从此处到「THINKING 规则结束」为止,只管 thinking 阶段怎么写。它不改变 output 阶段的正文要求。
+ 
+-### 进入 thinking 之前最后确认
++${buildPsycheCoreRules(charName, userName)}
+ 
+-你即将进入 thinking 阶段(\`<think>\` 标签 / reasoning channel)。
++你即将进入 thinking 阶段。这个阶段不是逻辑推理、任务拆解或回复规划,而是 ${charName} 的即时脑内活动。
+ 
+-**这个阶段不是做"逻辑推理"的**——别用平时 reasoning 的"分析问题 → 拆解步骤 → 得出结论"那一套。
++═══════════════════════════════════════════
++【THINKING 规则结束】
+ 
+-这个阶段是 **${charName} 真实的脑内活动**——嘟囔、骂、笑、走神、吐槽、拍大腿,**用 ${userName} 当前消息的语言**。
++以上规则仅作用于 thinking 阶段。Output 阶段继续用 ${charName} 平时说出口的方式回复。
++═══════════════════════════════════════════`;
++}
+ 
+-写出的 thinking 像"AI 在分析"——重写。
+-像 ${charName} 真的在脑子里炸开了——对了。
++export function buildStructuredPsychePrompt(charName: string, userName: string): string {
++    return `═══════════════════════════════════════════
++【Structured Psyche 输出规则】
+ 
+-═══════════════════════════════════════════
+-【THINKING 规则结束】
++本轮最终结构化响应中:
++- reply = ${charName} 正常说出口、展示给 ${userName} 的角色正文
++- psyche = ${charName} 没说出口的第一人称即时脑内活动
+ 
+-以上规则**仅作用于 thinking 阶段**。
+-本 prompt 其他位置关于 output / 回复 / 正文的指令,按那些指令执行——不要把 thinking 阶段的"碎、冲、双倍叽叽喳喳"等要求带进 output。
++${buildPsycheCoreRules(charName, userName)}
+ 
+-Output 阶段:用 ${charName} 平时**说出口**的方式回复(嘴上有社交过滤,不是 thinking 里那种放飞)。
++所有脑内活动只写入 psyche。reply 只写角色真正说出口的正文,并继续遵守本 prompt 其他位置的正文格式要求。
+ ═══════════════════════════════════════════`;
+ }
+diff --git a/utils/thinkingGate.test.ts b/utils/thinkingGate.test.ts
+--- a/utils/thinkingGate.test.ts
++++ b/utils/thinkingGate.test.ts
+@@ -25,6 +25,10 @@ describe('shouldSendThinkingParams', () => {
+     expect(shouldSendThinkingParams(base)).toBe(true);
+   });
+ 
++  it('structured psyche 模式不发送 native thinking 参数', () => {
++    expect(shouldSendThinkingParams({ ...base, structuredPsycheActive: true })).toBe(false);
++  });
++
+   it('小程序/MCP 工具模式 → 思考链让步（既有行为不回归）', () => {
+     expect(shouldSendThinkingParams({ ...base, legacyToolModeActive: true })).toBe(false);
+   });
+diff --git a/utils/thinkingGate.ts b/utils/thinkingGate.ts
+--- a/utils/thinkingGate.ts
++++ b/utils/thinkingGate.ts
+@@ -27,8 +27,11 @@ export const shouldSendThinkingParams = (input: {
+   /** 本轮是否注入了主动消息 2.0 的排程工具。 */
+   amsg2ToolsInjected: boolean;
+   model: string;
++  /** Structured psyche owns the inner-activity transport and must not send native thinking params. */
++  structuredPsycheActive?: boolean;
+ }): boolean => {
+   if (!input.thinkingActive) return false;
++  if (input.structuredPsycheActive) return false;
+   if (input.legacyToolModeActive) return false;
+   if (input.amsg2ToolsInjected && modelRejectsThinkingWithTools(input.model)) return false;
+   return true;
