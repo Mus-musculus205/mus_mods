@@ -85,7 +85,15 @@ pnpm add @capawesome/capacitor-live-update@^6.7.0
 
 需要已经有 `@capacitor/core` 与 `@capacitor/android` 6.x。
 
-如果你的仓库里已经有同名文件（比如 `NativeFilePolicy.java` 或 `ApkInstallerPlugin.java`），请手动合并，不要直接覆盖。
+上游 SullyOS 已经有下面 3 个同名文件，那是只有 APK 更新的旧版本。本包的版本会替换掉它们；如果你自己改过这几个文件，请手动合并：
+
+```text
+utils/androidAppUpdate.ts
+utils/androidAppUpdate.test.ts
+components/settings/AndroidUpdateControl.tsx
+```
+
+上游仓库不包含 `android/` 工程。如果你本地的 `android/` 里已经有同名的 Java 文件（比如 `ApkInstallerPlugin.java`），同样手动合并，不要直接覆盖。
 
 ### 2. 全局替换占位符
 
