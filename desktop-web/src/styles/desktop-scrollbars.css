@@ -1,0 +1,38 @@
+.desktop-scrollbar::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+.desktop-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+html.is-desktop .desktop-scrollbar {
+  -ms-overflow-style: auto;
+  scrollbar-width: thin;
+  scrollbar-color: hsla(var(--primary-hue, 245), var(--primary-sat, 25%), 52%, 0.45) transparent;
+}
+html.is-desktop .desktop-scrollbar::-webkit-scrollbar {
+  display: block;
+  width: 10px;
+  height: 10px;
+}
+html.is-desktop .desktop-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+  border-radius: 9999px;
+}
+html.is-desktop .desktop-scrollbar::-webkit-scrollbar-track:hover {
+  background: hsla(var(--primary-hue, 245), var(--primary-sat, 25%), 50%, 0.08);
+}
+html.is-desktop .desktop-scrollbar::-webkit-scrollbar-thumb {
+  background: hsla(var(--primary-hue, 245), var(--primary-sat, 25%), 52%, 0.45);
+  border-radius: 9999px;
+  border: 1px solid transparent;
+  background-clip: padding-box;
+  transition: background-color 0.2s ease;
+}
+html.is-desktop .desktop-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: hsla(var(--primary-hue, 245), var(--primary-sat, 25%), 46%, 0.75);
+}
+html.is-desktop .desktop-scrollbar::-webkit-scrollbar-thumb:active {
+  background: hsla(var(--primary-hue, 245), var(--primary-sat, 25%), 40%, 0.95);
+}

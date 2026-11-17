@@ -6,6 +6,7 @@
 | :--- | :--- |
 | [`structured-psyche/`](./structured-psyche/) | 主聊天的结构化心象输出：一次请求同时拿到正文和没说出口的心象，补丁形式安装 |
 | [`dual-track-update/`](./dual-track-update/) | 安卓版双轨更新：前端改动走 Web 热更新，原生改动走完整 APK，CI 自动判断发哪一种 |
+| [`desktop-web/`](./desktop-web/) | 网页桌面自由网格、文件夹、跨页拖拽和键鼠交互，附 App 注册表与小组件注册表的源码增量 |
 
 发布包不记录开发仓库名称、分支或提交标识。不同版本的 SullyOS 代码位置可能有差异，请先看各目录的说明再合并。
 
