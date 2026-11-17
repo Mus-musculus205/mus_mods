@@ -1,0 +1,384 @@
+name: SullyOS Dual-Track Release Pipeline
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      force_apk_build:
+        description: '强制构建并发布完整 APK 底座'
+        required: false
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      force_apk_build:
+        required: false
+        type: boolean
+        default: false
+      rebaseline_mode:
+        required: false
+        type: boolean
+        default: false
+      target_source_sha:
+        required: false
+        type: string
+        default: ''
+      confirm_target_source_sha:
+        required: false
+        type: string
+        default: ''
+      expected_deployed_head_sha:
+        required: false
+        type: string
+        default: ''
+      expected_apk_base_sha:
+        required: false
+        type: string
+        default: ''
+      confirm_rebaseline:
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: sullyos-release-pipeline
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Release Decision & Pipeline
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      RELEASES_REPO_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+      PUBLIC_RELEASES_REPO: ${{ vars.PUBLIC_RELEASES_REPO || 'your-name/your-app-releases' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_source_sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout trusted release control plane
+        if: inputs.rebaseline_mode == true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: .release-control
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify Checked-out Source Identity
+        id: source
+        shell: bash
+        env:
+          TARGET_SOURCE_SHA: ${{ inputs.target_source_sha || '' }}
+          REBASELINE_MODE: ${{ inputs.rebaseline_mode || 'false' }}
+        run: |
+          source_sha="$(git rev-parse HEAD | tr '[:upper:]' '[:lower:]')"
+          git cat-file -e "${source_sha}^{commit}"
+          if [ "$REBASELINE_MODE" = "true" ]; then
+            target_sha="$(printf '%s' "$TARGET_SOURCE_SHA" | tr '[:upper:]' '[:lower:]')"
+            if ! [[ "$target_sha" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::target_source_sha 必须为完整 40 位 Git SHA"
+              exit 1
+            fi
+            if [ "$source_sha" != "$target_sha" ]; then
+              echo "::error::checkout HEAD ($source_sha) 与 target_source_sha ($target_sha) 不一致"
+              exit 1
+            fi
+            if [ ! -f utils/webUpdateSignature.ts ] || ! grep -q "verifyWebUpdateManifestSignature" utils/webUpdate.ts; then
+              echo "::error::目标源码不包含受信任的 Web manifest 验证链，拒绝生成不安全的新 APK baseline"
+              exit 1
+            fi
+          fi
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+          run_install: false
+
+      - name: Get pnpm store directory
+        shell: bash
+        run: |
+          echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
+
+      - name: Setup pnpm cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Clone Stable Pointers Snapshot (Anonymous Shallow Clone)
+        shell: bash
+        run: |
+          target_repo="${PUBLIC_RELEASES_REPO:-your-name/your-app-releases}"
+          echo "正在从 $target_repo 克隆主分支稳定指针快照..."
+          rm -rf releases-repo
+          if git clone --depth 1 "https://github.com/${target_repo}.git" releases-repo; then
+            echo "已读取远端指针快照"
+          else
+            echo "远端状态仓库为空或克隆失败，初始化本地目录结构"
+            mkdir -p releases-repo
+          fi
+
+      - name: Run Pre-flight Freshness Guard & Release Decision
+        id: decision
+        shell: bash
+        env:
+          GITHUB_SHA: ${{ steps.source.outputs.source_sha }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          FORCE_APK_BUILD: ${{ inputs.force_apk_build || 'false' }}
+          REBASELINE_MODE: ${{ inputs.rebaseline_mode || 'false' }}
+          TARGET_SOURCE_SHA: ${{ inputs.target_source_sha || '' }}
+          CONFIRM_TARGET_SOURCE_SHA: ${{ inputs.confirm_target_source_sha || '' }}
+          EXPECTED_DEPLOYED_HEAD_SHA: ${{ inputs.expected_deployed_head_sha || '' }}
+          EXPECTED_APK_BASE_SHA: ${{ inputs.expected_apk_base_sha || '' }}
+          CONFIRM_REBASELINE: ${{ inputs.confirm_rebaseline || '' }}
+          RELEASES_DIR: releases-repo
+        run: |
+          if [ "$REBASELINE_MODE" = "true" ]; then
+            pnpm exec tsx .release-control/scripts/release/prepareRebaseline.ts
+          else
+            pnpm exec tsx scripts/release/decideRelease.ts
+          fi
+
+      - name: Early Exit on No-op
+        if: steps.decision.outputs.action == 'noop'
+        shell: bash
+        run: |
+          echo "发布决策为 noop: ${{ steps.decision.outputs.decision_reason }}"
+          echo "流水线幂等成功结束。"
+          exit 0
+
+      - name: Compute Build & Version Identifiers
+        if: steps.decision.outputs.action == 'apk' || steps.decision.outputs.action == 'web'
+        id: versioning
+        shell: bash
+        run: |
+          if [ "${{ inputs.rebaseline_mode || 'false' }}" = "true" ]; then
+            pnpm exec tsx .release-control/scripts/release/computeVersioning.ts
+          else
+            pnpm exec tsx scripts/release/computeVersioning.ts
+          fi
+        env:
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+          RELEASES_DIR: releases-repo
+
+      - name: Validate Web Update Signing Secrets
+        if: steps.decision.outputs.action == 'apk' || steps.decision.outputs.action == 'web'
+        shell: bash
+        env:
+          PRIVATE_KEY: ${{ secrets.WEB_UPDATE_SIGNING_PRIVATE_KEY_BASE64 }}
+          PUBLIC_KEY: ${{ secrets.WEB_UPDATE_SIGNING_PUBLIC_KEY_BASE64 }}
+          KEY_ID: ${{ secrets.WEB_UPDATE_SIGNING_KEY_ID }}
+        run: |
+          missing=()
+          [ -z "$PRIVATE_KEY" ] && missing+=("WEB_UPDATE_SIGNING_PRIVATE_KEY_BASE64")
+          [ -z "$PUBLIC_KEY" ] && missing+=("WEB_UPDATE_SIGNING_PUBLIC_KEY_BASE64")
+          [ -z "$KEY_ID" ] && missing+=("WEB_UPDATE_SIGNING_KEY_ID")
+          if [ ${#missing[@]} -ne 0 ]; then
+            echo "::error::缺少 Web 更新签名 Secret: ${missing[*]}"
+            exit 1
+          fi
+
+      - name: Build Web Application
+        if: steps.decision.outputs.action == 'apk' || steps.decision.outputs.action == 'web'
+        run: |
+          pnpm run build
+        env:
+          VITE_APK_UPDATE_MANIFEST_URL: https://github.com/${{ env.PUBLIC_RELEASES_REPO }}/releases/latest/download/update-manifest.json
+          VITE_WEB_UPDATE_MANIFEST_URL: https://raw.githubusercontent.com/${{ env.PUBLIC_RELEASES_REPO }}/main/web-update-manifest.json
+          VITE_WEB_UPDATE_SIGNING_PUBLIC_KEY_BASE64: ${{ secrets.WEB_UPDATE_SIGNING_PUBLIC_KEY_BASE64 }}
+          VITE_WEB_UPDATE_SIGNING_KEY_ID: ${{ secrets.WEB_UPDATE_SIGNING_KEY_ID }}
+          BUILD_NUMBER: ${{ env.BUILD_NUMBER }}
+
+      - name: Package Web Bundle & Generate Manifest (Schema 2)
+        if: steps.decision.outputs.action == 'apk' || steps.decision.outputs.action == 'web'
+        shell: bash
+        run: |
+          (cd dist && zip -q -r ../web-bundle.zip .)
+          if [ "${{ inputs.rebaseline_mode || 'false' }}" = "true" ]; then
+            pnpm exec tsx .release-control/scripts/release/generateWebManifest.ts
+          else
+            pnpm exec tsx scripts/release/generateWebManifest.ts
+          fi
+        env:
+          PUBLIC_RELEASES_REPO: ${{ env.PUBLIC_RELEASES_REPO }}
+          GITHUB_SHA: ${{ steps.source.outputs.source_sha }}
+          WEB_UPDATE_SIGNING_PRIVATE_KEY_BASE64: ${{ secrets.WEB_UPDATE_SIGNING_PRIVATE_KEY_BASE64 }}
+          WEB_UPDATE_SIGNING_PUBLIC_KEY_BASE64: ${{ secrets.WEB_UPDATE_SIGNING_PUBLIC_KEY_BASE64 }}
+          WEB_UPDATE_SIGNING_KEY_ID: ${{ secrets.WEB_UPDATE_SIGNING_KEY_ID }}
+          BUILD_NUMBER: ${{ env.BUILD_NUMBER }}
+          VERSION_TAG: ${{ env.VERSION_TAG }}
+          WEB_RELEASE_TAG: ${{ env.WEB_RELEASE_TAG }}
+          WEB_ASSET_RELEASE_TAG: ${{ steps.decision.outputs.action == 'apk' && env.APK_RELEASE_TAG || env.WEB_RELEASE_TAG }}
+
+      # --- WEB LIVE UPDATE 分支 ---
+      - name: Publish Web Release (Artifact-First, Pointer-Last)
+        if: steps.decision.outputs.action == 'web'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+          PUBLIC_RELEASES_REPO: ${{ env.PUBLIC_RELEASES_REPO }}
+          GITHUB_SHA: ${{ steps.source.outputs.source_sha }}
+          EXPECTED_DEPLOYED_HEAD_SHA: ${{ steps.decision.outputs.deployed_head_sha }}
+          EXPECTED_APK_BASE_SHA: ${{ steps.decision.outputs.apk_base_sha }}
+          BUILD_NUMBER: ${{ env.BUILD_NUMBER }}
+          WEB_RELEASE_TAG: ${{ env.WEB_RELEASE_TAG }}
+        run: |
+          gh auth setup-git
+          if [ "${{ inputs.rebaseline_mode || 'false' }}" = "true" ]; then
+            pnpm exec tsx .release-control/scripts/release/publishRelease.ts web
+          else
+            pnpm exec tsx scripts/release/publishRelease.ts web
+          fi
+
+      # --- APK RELEASE 分支 ---
+      - name: Validate Release Signing Secrets
+        if: steps.decision.outputs.action == 'apk'
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_RELEASE_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_RELEASE_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEY_PASSWORD }}
+        run: |
+          missing=()
+          [ -z "$KEYSTORE_BASE64" ] && missing+=("ANDROID_RELEASE_KEYSTORE_BASE64")
+          [ -z "$STORE_PASSWORD" ] && missing+=("ANDROID_RELEASE_STORE_PASSWORD")
+          [ -z "$KEY_ALIAS" ] && missing+=("ANDROID_RELEASE_KEY_ALIAS")
+          [ -z "$KEY_PASSWORD" ] && missing+=("ANDROID_RELEASE_KEY_PASSWORD")
+          if [ ${#missing[@]} -ne 0 ]; then
+            echo "::error::缺少 Android Release 签名密钥 Secret: ${missing[*]}"
+            exit 1
+          fi
+
+      - name: Setup Java JDK 17
+        if: steps.decision.outputs.action == 'apk'
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Setup Android SDK
+        if: steps.decision.outputs.action == 'apk'
+        uses: android-actions/setup-android@v3
+        with:
+          packages: ''
+
+      - name: Sync Capacitor Android
+        if: steps.decision.outputs.action == 'apk'
+        run: npx cap sync android
+
+      - name: Restore Release Keystore
+        if: steps.decision.outputs.action == 'apk'
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_RELEASE_KEYSTORE_BASE64 }}
+        run: |
+          echo "$KEYSTORE_BASE64" | base64 -d > android/app/release.keystore
+
+      - name: Build Android APK (Release)
+        if: steps.decision.outputs.action == 'apk'
+        run: |
+          cd android
+          chmod +x ./gradlew
+          ./gradlew assembleRelease -PversionCode=${{ env.VERSION_CODE }} -PversionName="${{ env.VERSION_NAME }}" --no-daemon --build-cache
+        env:
+          RELEASE_STORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_STORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.ANDROID_RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEY_PASSWORD }}
+
+      - name: Prepare APK Asset & Generate Manifest
+        if: steps.decision.outputs.action == 'apk'
+        shell: bash
+        run: |
+          cp android/app/build/outputs/apk/release/app-release.apk SullyOS-latest.apk
+          node << 'EOF'
+          const fs = require('fs');
+          const crypto = require('crypto');
+          const apkFile = 'SullyOS-latest.apk';
+          const buffer = fs.readFileSync(apkFile);
+          const sha256 = crypto.createHash('sha256').update(buffer).digest('hex');
+          const stat = fs.statSync(apkFile);
+          const publicRepo = process.env.PUBLIC_RELEASES_REPO;
+          const manifest = {
+            schemaVersion: 1,
+            versionCode: Number(process.env.VERSION_CODE),
+            versionName: process.env.VERSION_NAME,
+            sourceSha: process.env.GITHUB_SHA || '',
+            apkUrl: `https://github.com/${publicRepo}/releases/latest/download/SullyOS-latest.apk`,
+            sha256: sha256,
+            sizeBytes: stat.size,
+            publishedAt: new Date().toISOString(),
+            releaseNotes: [
+              `构建 #${process.env.GITHUB_RUN_NUMBER} (${(process.env.GITHUB_SHA || '').slice(0, 7)})`,
+              '包含最新底座与原生依赖更新'
+            ]
+          };
+          fs.writeFileSync('update-manifest.json', JSON.stringify(manifest, null, 2), 'utf8');
+          console.log('Generated update-manifest.json:\n', JSON.stringify(manifest, null, 2));
+          EOF
+        env:
+          PUBLIC_RELEASES_REPO: ${{ env.PUBLIC_RELEASES_REPO }}
+          GITHUB_SHA: ${{ steps.source.outputs.source_sha }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+          VERSION_CODE: ${{ env.VERSION_CODE }}
+          VERSION_NAME: ${{ env.VERSION_NAME }}
+
+      - name: Publish APK Release (Artifact-First, Pointer-Last)
+        if: steps.decision.outputs.action == 'apk'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+          PUBLIC_RELEASES_REPO: ${{ env.PUBLIC_RELEASES_REPO }}
+          GITHUB_SHA: ${{ steps.source.outputs.source_sha }}
+          EXPECTED_DEPLOYED_HEAD_SHA: ${{ steps.decision.outputs.deployed_head_sha }}
+          EXPECTED_APK_BASE_SHA: ${{ steps.decision.outputs.apk_base_sha }}
+          BUILD_NUMBER: ${{ env.BUILD_NUMBER }}
+          APK_RELEASE_TAG: ${{ env.APK_RELEASE_TAG }}
+          VERSION_NAME: ${{ env.VERSION_NAME }}
+        run: |
+          gh auth setup-git
+          if [ "${{ inputs.rebaseline_mode || 'false' }}" = "true" ]; then
+            pnpm exec tsx .release-control/scripts/release/publishRelease.ts apk
+          else
+            pnpm exec tsx scripts/release/publishRelease.ts apk
+          fi
+
+      # --- 清理旧 Release：APK 留最新 2 个、Web 留最新 5 个；指针引用的和 Latest 不删 ---
+      - name: Prune Old Releases
+        if: steps.decision.outputs.action == 'web' || steps.decision.outputs.action == 'apk'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+          PUBLIC_RELEASES_REPO: ${{ env.PUBLIC_RELEASES_REPO }}
+          WEB_RELEASE_TAG: ${{ env.WEB_RELEASE_TAG }}
+          APK_RELEASE_TAG: ${{ env.APK_RELEASE_TAG }}
+        run: |
+          if [ "${{ inputs.rebaseline_mode || 'false' }}" = "true" ]; then
+            pnpm exec tsx .release-control/scripts/release/pruneReleases.ts
+          else
+            pnpm exec tsx scripts/release/pruneReleases.ts
+          fi
+

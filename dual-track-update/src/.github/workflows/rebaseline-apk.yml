@@ -1,0 +1,40 @@
+name: SullyOS Explicit SHA APK Rebaseline
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_source_sha:
+        description: '要构建的完整 40 位源码 SHA'
+        required: true
+        type: string
+      confirm_target_source_sha:
+        description: '再次输入完全相同的完整 40 位源码 SHA'
+        required: true
+        type: string
+      expected_deployed_head_sha:
+        description: '当前 web-update-manifest.json 的完整 sourceSha'
+        required: true
+        type: string
+      expected_apk_base_sha:
+        description: '当前 update-manifest.json 的完整 sourceSha'
+        required: true
+        type: string
+      confirm_rebaseline:
+        description: '输入 REBASELINE 确认重建 APK 与 Web 双基线'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  rebaseline:
+    uses: ./.github/workflows/build-apk.yml
+    with:
+      rebaseline_mode: true
+      target_source_sha: ${{ inputs.target_source_sha }}
+      confirm_target_source_sha: ${{ inputs.confirm_target_source_sha }}
+      expected_deployed_head_sha: ${{ inputs.expected_deployed_head_sha }}
+      expected_apk_base_sha: ${{ inputs.expected_apk_base_sha }}
+      confirm_rebaseline: ${{ inputs.confirm_rebaseline }}
+    secrets: inherit
